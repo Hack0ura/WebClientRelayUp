@@ -77,28 +77,39 @@ namespace Httprelayserver.AuthTrigger
             IntPtr binding = IntPtr.Zero;
             Int32 status;
 
+            Console.WriteLine($"[DEBUG][EfsApi] Bind() called: server={server}, UseNullSession={UseNullSession}, interfaceid={interfaceid}");
+            Console.WriteLine($"[DEBUG][EfsApi] PipeName={PipeName ?? "(null)"}, RPCTimeOut={RPCTimeOut}ms");
+
             // IMPORTANT FIX FOR WINDOWS 11:
             // First parameter is Object UUID, NOT Interface UUID!
             // Object UUID should be null for EFSRPC - Windows 11 is strict about this
             // The Interface UUID is already set in the MIDL_STUB_DESC structure
+            Console.WriteLine($"[DEBUG][EfsApi] RpcStringBindingCompose(ObjUuid=null, ProtSeq=ncacn_np, server={server}, pipe={PipeName ?? "(null)"})");
             status = RpcStringBindingCompose(null, "ncacn_np", server, PipeName, null, out bindingstring);
             if (status != 0)
             {
+                Console.WriteLine($"[DEBUG][EfsApi] RpcStringBindingCompose FAILED: status=0x{status:x8}");
                 Console.WriteLine("[x]RpcStringBindingCompose failed with status 0x" + status.ToString("x"));
                 return IntPtr.Zero;
             }
 
-            status = RpcBindingFromStringBinding(Marshal.PtrToStringUni(bindingstring), out binding);
+            string bindingStr = Marshal.PtrToStringUni(bindingstring);
+            Console.WriteLine($"[DEBUG][EfsApi] Binding string: {bindingStr}");
+
+            status = RpcBindingFromStringBinding(bindingStr, out binding);
             RpcBindingFree(ref bindingstring);
             if (status != 0)
             {
+                Console.WriteLine($"[DEBUG][EfsApi] RpcBindingFromStringBinding FAILED: status=0x{status:x8}");
                 Console.WriteLine("[x]RpcBindingFromStringBinding failed with status 0x" + status.ToString("x"));
                 return IntPtr.Zero;
             }
+            Console.WriteLine($"[DEBUG][EfsApi] RPC binding created: handle=0x{binding:x}");
 
             //Todo
             if (UseNullSession)
             {
+                Console.WriteLine("[DEBUG][EfsApi] Using NULL session auth");
                 // note: windows xp doesn't support user or domain = "" => return 0xE
                 SEC_WINNT_AUTH_IDENTITY identity = new SEC_WINNT_AUTH_IDENTITY();
                 identity.User = "";
@@ -118,25 +129,41 @@ namespace Httprelayserver.AuthTrigger
                 qoshandle.Free();
                 if (status != 0)
                 {
+                    Console.WriteLine($"[DEBUG][EfsApi] RpcBindingSetAuthInfoEx FAILED: status=0x{status:x8}");
                     Console.WriteLine("[x]RpcBindingSetAuthInfoEx failed with status 0x" + status.ToString("x"));
+                }
+                else
+                {
+                    Console.WriteLine("[DEBUG][EfsApi] RpcBindingSetAuthInfoEx OK (null session)");
                 }
             }
             else
             {
+                Console.WriteLine($"[DEBUG][EfsApi] RpcBindingSetAuthInfo(server={server}, AuthnLevel=PKT_PRIVACY(6), AuthnSvc=GSS_NEGOTIATE(9))");
                 status = RpcBindingSetAuthInfo(binding, server, /* RPC_C_AUTHN_LEVEL_PKT_PRIVACY */ 6, /* RPC_C_AUTHN_GSS_NEGOTIATE */ 9, IntPtr.Zero, 0);
                 if (status != 0)
                 {
+                    Console.WriteLine($"[DEBUG][EfsApi] RpcBindingSetAuthInfo FAILED: status=0x{status:x8}");
                     Console.WriteLine("[x]RpcBindingSetAuthInfo failed with status 0x" + status.ToString("x"));
+                }
+                else
+                {
+                    Console.WriteLine("[DEBUG][EfsApi] RpcBindingSetAuthInfo OK");
                 }
             }
 
             status = RpcBindingSetOption(binding, 12, new IntPtr(RPCTimeOut));
             if (status != 0)
             {
+                Console.WriteLine($"[DEBUG][EfsApi] RpcBindingSetOption(timeout) FAILED: status=0x{status:x8}");
                 Console.WriteLine("[x]RpcBindingSetOption failed with status 0x" + status.ToString("x"));
             }
-            //Console.WriteLine("[!]binding ok (handle=" + binding.ToString("x") + ")");
+            else
+            {
+                Console.WriteLine($"[DEBUG][EfsApi] RPC timeout set to {RPCTimeOut}ms");
+            }
 
+            Console.WriteLine($"[DEBUG][EfsApi] Bind() returning handle=0x{binding:x}");
             return binding;
         }
 

