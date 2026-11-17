@@ -1,5 +1,5 @@
 ﻿using Httprelayserver.AuthTrigger;
-
+using Microsoft.Win32;
 
 namespace HttpLdapRelay
 {
@@ -154,6 +154,9 @@ namespace HttpLdapRelay
                 return 0;
             }
 
+            // KB5135557 detection
+            CheckKB5135557Compatibility();
+
             Console.WriteLine();
             if (!useIpp)
             {
@@ -249,6 +252,52 @@ namespace HttpLdapRelay
             Console.WriteLine("[*] Server stopped. Press any key to exit...");
             Console.ReadKey();
             return 0;
+        }
+
+        static void CheckKB5135557Compatibility()
+        {
+            // Only relevant on Windows 11 (build >= 22000) after the KB5135557 release date
+            if (Environment.OSVersion.Version.Build < 22000)
+                return;
+            if (DateTime.Now < new DateTime(2026, 11, 10))
+                return;
+
+            Console.WriteLine(@"[*] Windows 11 post-2026/11/10 - checking NTLM signing policy...");
+
+            try
+            {
+                using var key = Registry.LocalMachine.OpenSubKey(@"SYSTEM\CurrentControlSet\Control\Lsa\MSV1_0");
+                if (key != null)
+                {
+                    object val = key.GetValue("ClientAllowUnsignedNtlm");
+                    if (val is int intVal && intVal == 1)
+                    {
+                        Console.ForegroundColor = ConsoleColor.Green;
+                        Console.WriteLine("[+] ClientAllowUnsignedNtlm = 1 - NTLM forced signing DISABLED");
+                        Console.ResetColor();
+                        return;
+                    }
+                }
+
+                Console.ForegroundColor = ConsoleColor.Yellow;
+                Console.WriteLine("[!] ═══════════════════════════════════════════════════════");
+                Console.WriteLine("[!]   WARNING: TARGET IS PROBABLY PATCHED (KB5135557)");
+                Console.WriteLine("[!] ═══════════════════════════════════════════════════════");
+                Console.WriteLine("[!] ClientAllowUnsignedNtlm is not set to 1.");
+                Console.WriteLine("[!] Windows will force NTLMSSP_NEGOTIATE_SIGN + MIC on all");
+                Console.WriteLine("[!] NTLM connections, blocking HTTP→LDAP relay.");
+                Console.WriteLine("[!]");
+                Console.WriteLine("[!] Exploit will probably fail !");
+                Console.WriteLine("[!]");
+                Console.WriteLine("[!] ═══════════════════════════════════════════════════════");
+                Console.ResetColor();
+            }
+            catch (Exception ex)
+            {
+                Console.ForegroundColor = ConsoleColor.Yellow;
+                Console.WriteLine($"[!] Could not check NTLM signing policy: {ex.Message}");
+                Console.ResetColor();
+            }
         }
 
         static void ShowHelp()

