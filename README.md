@@ -4,8 +4,24 @@
 
 > https://www.advens.com/
 
+---------------------
+**IMPORTANT UPDATE**  
+---------------------  
 
-**This is basically an universal no-fix local privilege escalation in domain-joined windows workstations in default configuration.**  
+Recent security improvement of NTLM authentication was released by Microsoft with KB5135557 (https://support.microsoft.com/en-us/servicing/os/windows/docs/2026/11/kb5135557-ntlm-signing-security-improvements).
+It ensures that client always negotiates signed messages when using NTLM authentication on the client side, even if LDAP signing is not set. 
+
+To verify if the workstation is still vulnerable, it is necessary check if the KB is installed, or if this registry key is set :
+```
+> reg query HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Control\Lsa\MSV1_0 /v ClientAllowUnsignedNtlm
+  Expected value to be vuln: 1
+
+If this registry key does not exists, then its default value is used, which is 0 : "Always propose Signing".
+```
+
+This implies that this relay technique is not an universal privesc exploiting anymore, but stills exists with a weak configuration ! :) 
+
+---------------------
 
 **Tested on Windows 10 and 11**
 
@@ -79,6 +95,10 @@ https://github.com/user-attachments/assets/647d85ff-610d-4204-ae30-96b2d9ff888b
 The best way to protect yourself against this kind of technique is to enforce LDAP Signing and LDAP Channel Binding. This mitigates relay-based attacks. This can be configured via the "Domain Controller: LDAP server signing requirements" GPO.
 
 You may disable WebClient service on workstations, but make sure that it is not necessary for some application running on your system.
+
+**NEW**
+- Install KB5135557 security patch.
+- Verify that "HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Control\Lsa\MSV1_0 /v ClientAllowUnsignedNtlm" is not set to 1.
 
 ## Detection
 
